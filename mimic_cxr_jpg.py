@@ -15,7 +15,7 @@ import os
 from pathlib import Path
 import zipfile
 
-topdir = Path("/mnt/DGX01/Personal/4jh/cxr/MIMIC-CXR-JPG")
+topdir = Path("/mnt/HDD/dataset/medical_report")
 chexpert_labels = [
     "Atelectasis",
     "Cardiomegaly",
@@ -40,6 +40,7 @@ normalize = transforms.Normalize(
 
 def load_all_metadata(
         data_dir=topdir,  # directory containing all the .csv.gz files
+        subject_prefix_filter=None,  # Filter by subject_id prefix (e.g., ['10', '11'])
     ):
     """
     Load all metadata files, joining appropriately.
@@ -51,12 +52,33 @@ def load_all_metadata(
     - mimic-cxr-2.0.0-chexpert.csv.gz
     - mimic-cxr-2.0.0-split.csv.gz
     - mimic-cxr-reports.zip
+
+    Args:
+        data_dir: Directory containing CSV files
+        subject_prefix_filter: List of subject_id prefixes to include (e.g., ['10', '11'])
     """
     data_dir = Path(data_dir)
-
     metadata = pd.read_csv(data_dir / "mimic-cxr-2.0.0-metadata.csv.gz")
     chexpert = pd.read_csv(data_dir / "mimic-cxr-2.0.0-chexpert.csv.gz")
-    splitpaths = pd.read_csv(data_dir / "splitpaths.csv.gz")
+
+    # Load split file - try splitpaths.csv.gz first, then mimic-cxr-2.0.0-split.csv.gz
+    if (data_dir / "splitpaths.csv.gz").exists():
+        splitpaths = pd.read_csv(data_dir / "splitpaths.csv.gz")
+    else:
+        splitpaths = pd.read_csv(data_dir / "mimic-cxr-2.0.0-split.csv.gz")
+        # Generate path column if it doesn't exist
+        if 'path' not in splitpaths.columns:
+            splitpaths['path'] = splitpaths.apply(
+                lambda row: f"p{str(row['subject_id'])[:2]}/p{row['subject_id']}/s{row['study_id']}/{row['dicom_id']}.jpg",
+                axis=1
+            )
+
+    # Filter by subject_id prefix if specified
+    if subject_prefix_filter is not None:
+        splitpaths['subject_prefix'] = splitpaths['subject_id'].astype(str).str[:2]
+        splitpaths = splitpaths[splitpaths['subject_prefix'].isin(subject_prefix_filter)]
+        splitpaths = splitpaths.drop(columns=['subject_prefix'])
+        print(f"Filtered to subject prefixes {subject_prefix_filter}: {len(splitpaths)} records")
 
     meta = pd.merge(
         metadata,
@@ -184,7 +206,7 @@ class MIMICCXRJPGDataset(Dataset):
                 transforms.RandomRotation(degrees=[-20, 20]),
             ]
         ),
-        image_subdir="files",
+        image_subdir="mimic-cxr-jpg/2.1.0/files",
         label_method="zeros_uncertain_nomask",  # old default: "ignore_uncertain"
         load_activations=False,  # If True, load .pth files and do not apply transforms
     ):
@@ -217,7 +239,7 @@ class MIMICCXRJPGDataset(Dataset):
         mask = []
         for i, c in enumerate(chexpert_labels):
             m = self.label_method[c]
-            l = float(row[i])
+            l = float(row[c])  # Use label name instead of index
             if m == "ignore_uncertain":
                 mask.append(1 - np.isnan(l) + (l == -1.0))
                 labels.append(l == 1.0)
@@ -275,29 +297,62 @@ class MIMICCXRJPGDataset(Dataset):
         return labels, mask
 
     def get_from_row(self, row):
-        if self.load_activations:
-            # Replace extension with .pt
-            b, _ = os.path.splitext(row.path)
-            pthpath = b + ".pt"
-            im = torch.load(self.datadir / pthpath)
-        else:
-            im = Image.open(self.datadir / row.path)
+        try:
+            if self.load_activations:
+                # Replace extension with .pt
+                b, _ = os.path.splitext(row.path)
+                pthpath = b + ".pt"
+                im = torch.load(self.datadir / pthpath)
+            else:
+                image_path = self.datadir / row.path
+                # Check if file exists
+                if not os.path.exists(image_path):
+                    return None
 
-            if self.transform is not None:
-                im = self.transform(im)
+                im = Image.open(image_path)
 
-            if self.downscale_factor is not None:
-                im = F.avg_pool2d(im.type(torch.float32), self.downscale_factor)
+                if self.transform is not None:
+                    im = self.transform(im)
 
-        labels, labelmask = self.map_labels(row[self.labels])
+                if self.downscale_factor is not None:
+                    im = F.avg_pool2d(im.type(torch.float32), self.downscale_factor)
 
-        return im, labels, labelmask
+            labels, labelmask = self.map_labels(row[self.labels])
+
+            # Create contiguous copies to avoid storage sharing issues in multi-processing
+            # This is necessary when recursive __getitem__ calls occur
+            im = im.contiguous().clone()
+            labels = labels.contiguous().clone()
+            labelmask = labelmask.contiguous().clone()
+
+            return im, labels, labelmask
+        except Exception as e:
+            # If any error occurs, return None
+            print(f"Warning: Failed to load image {row.path}: {e}")
+            return None
 
 
     def __getitem__(self, ix):
-        row = self.dataframe.iloc[ix]
+        # Use iteration instead of recursion to avoid storage sharing issues
+        max_attempts = 10
+        original_ix = ix
 
-        return self.get_from_row(row)
+        for attempt in range(max_attempts):
+            row = self.dataframe.iloc[ix]
+            result = self.get_from_row(row)
+
+            if result is not None:
+                return result
+
+            # Try next index
+            ix = (ix + 1) % len(self.dataframe)
+
+            # Avoid infinite loop
+            if ix == original_ix:
+                break
+
+        # If all attempts failed, raise error
+        raise RuntimeError(f"Failed to load valid sample after {max_attempts} attempts starting from index {original_ix}")
 
 
 def collate_studies(studies):
@@ -499,6 +554,7 @@ def records_dataset(
 def official_split(
     datadir=topdir,
     dicom_id_file=None,
+    subject_prefix_filter=None,
     **kwargs,
 ):
     """
@@ -506,10 +562,13 @@ def official_split(
     this function implements.
 
     Three datasets are returned in this order: train, validate, test.
+
+    Args:
+        subject_prefix_filter: List of subject_id prefixes to include (e.g., ['10', '11'])
     """
     datadir = Path(datadir)
 
-    allrecords = load_all_metadata(datadir)
+    allrecords = load_all_metadata(datadir, subject_prefix_filter=subject_prefix_filter)
 
     if dicom_id_file is not None:
         # restrict to only the given dicoms, if given
@@ -535,14 +594,18 @@ def cv(
     val_size=0.1,
     random_state=0,
     stratify=False,
+    subject_prefix_filter=None,
     **kwargs,
 ):
     """
     Cross-validation with splitting at subject level.
+
+    Args:
+        subject_prefix_filter: List of subject_id prefixes to include (e.g., ['10', '11'])
     """
     datadir = Path(datadir)
 
-    allrecords = load_all_metadata(datadir)
+    allrecords = load_all_metadata(datadir, subject_prefix_filter=subject_prefix_filter)
 
     if dicom_id_file is not None:
         # restrict to only the given dicoms, if given

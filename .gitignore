@@ -1,5 +1,60 @@
-__pycache__
-output
-.ipynb_checkpoints
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.venv
+env/
+venv/
+.direnv/
+.envrc
+
+# Data & Datasets
+*.csv
+*.h5
+*.hdf5
+*.pkl
+*.pickle
 mimic_jpg_filenames.txt
-.direnv
+data/
+datasets/
+
+# Model weights & checkpoints
+pretrained_weight/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+checkpoints/
+
+# Training outputs
+output/
+outputs/
+logs/
+runs/
+wandb/
+lightning_logs/
+
+# Temporary files
+*.log
+*.tmp
+.DS_Store
+Thumbs.db

@@ -1,0 +1,56 @@
+# ResNet50 Configuration for CXR Classification
+
+model:
+  name: "resnet50"
+  pretrained: true
+  num_classes: 14
+  freeze_backbone: false
+
+data:
+  datadir: "/mnt/HDD/dataset/medical_report"
+  image_subdir: "mimic-cxr-jpg/2.1.0/files"
+  dicom_id_file: null
+  label_method: "zeros_uncertain_nomask"
+  subject_prefix_filter: ['10', '11']  # Only use p10, p11, and p12 patients
+
+  split_type: "cv"
+  num_folds: 10
+  fold: 0
+  val_size: 0.1
+  random_state: 0
+  stratify: false
+
+training:
+  num_epochs: 50
+  batch_size: 8  # For 1024x1024 images
+  learning_rate: 1e-3
+  optimizer: "adam"
+  weight_decay: 0.0
+
+  lr_scheduler:
+    enabled: true
+    patience: 3
+    factor: 0.5
+    early_stop_patience: 10
+
+  val_iters: null
+  amp: true
+  distributed: false
+  single_node_parallel: false
+
+augmentation:
+  horizontal_flip: 0.5
+  rotation_degrees: 20
+  random_crop: false
+  color_jitter: false
+
+output:
+  dir: "./outputs/resnet50_experiment"
+  save_frequency: 1
+
+system:
+  num_workers: 4
+  pin_memory: true
+  device: "cuda"
+  seed: 0
+  progress_bar: true
