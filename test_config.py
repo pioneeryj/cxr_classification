@@ -151,6 +151,40 @@ class Tester:
             else:
                 new_state_dict[k] = v
 
+        # Check if key remapping is needed for BioViL model
+        # Compare checkpoint keys with model keys to detect structure mismatch
+        model_keys = set(self.model.state_dict().keys())
+        ckpt_keys = set(new_state_dict.keys())
+
+        # Detect if checkpoint was saved with different structure
+        # Case: checkpoint has 'encoder.encoder.conv1.weight' but model expects 'encoder.encoder.encoder.conv1.weight'
+        needs_remapping = False
+        if 'encoder.encoder.conv1.weight' in ckpt_keys and 'encoder.encoder.encoder.conv1.weight' in model_keys:
+            needs_remapping = True
+            print("Detected checkpoint key mismatch - applying key remapping for BioViL model")
+
+        if needs_remapping:
+            remapped_state_dict = {}
+            for k, v in new_state_dict.items():
+                new_key = k
+                # Remap encoder.encoder.* -> encoder.encoder.encoder.*
+                if k.startswith('encoder.encoder.') and not k.startswith('encoder.encoder.encoder.'):
+                    new_key = 'encoder.encoder.encoder.' + k[len('encoder.encoder.'):]
+                # Remap encoder.missing_previous_emb -> encoder.encoder.missing_previous_emb
+                elif k == 'encoder.missing_previous_emb':
+                    new_key = 'encoder.encoder.missing_previous_emb'
+                # Remap encoder.backbone_to_vit.* -> encoder.encoder.backbone_to_vit.*
+                elif k.startswith('encoder.backbone_to_vit.'):
+                    new_key = 'encoder.encoder.backbone_to_vit.' + k[len('encoder.backbone_to_vit.'):]
+                # Remap encoder.vit_pooler.* -> encoder.encoder.vit_pooler.*
+                elif k.startswith('encoder.vit_pooler.'):
+                    new_key = 'encoder.encoder.vit_pooler.' + k[len('encoder.vit_pooler.'):]
+                # Remap projector.* -> encoder.projector.*
+                elif k.startswith('projector.'):
+                    new_key = 'encoder.projector.' + k[len('projector.'):]
+                remapped_state_dict[new_key] = v
+            new_state_dict = remapped_state_dict
+
         self.model.load_state_dict(new_state_dict)
         print(f"Checkpoint loaded successfully (Epoch: {self.epoch if self.epoch is not None else 'Unknown'})")
 
