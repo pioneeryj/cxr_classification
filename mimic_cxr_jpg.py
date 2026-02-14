@@ -7,7 +7,7 @@ import torch
 import torchvision
 import torch.nn.functional as F
 from torchvision import transforms
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torchvision import transforms
 from tqdm import tqdm
 
@@ -110,6 +110,99 @@ def label_prevalences(dataloader):
             labels = labels.sum(dim=0)
             sum_label = sum_label + labels.type(torch.float64)
     return sum_label / num_instances
+
+
+def get_sqrt_resampling_sampler(dataset, num_samples=None):
+    """Create a WeightedRandomSampler with square root resampling for multi-label data.
+
+    Args:
+        dataset: MIMICCXRJPGDataset instance
+        num_samples: Number of samples per epoch (default: len(dataset))
+
+    Returns:
+        WeightedRandomSampler
+    """
+    # Extract labels from DataFrame directly (efficient, no DataLoader iteration)
+    df = dataset.dataframe[chexpert_labels].copy()
+    labels = (df == 1.0).astype(np.float32).values  # [N, 14]
+
+    # Class-wise positive counts
+    class_counts = labels.sum(axis=0)  # [14]
+
+    # Square root inverse frequency weights
+    class_weights = 1.0 / (np.sqrt(class_counts) + 1e-8)  # [14]
+
+    # Per-sample weight: max weight among active (positive) labels
+    sample_weights = np.zeros(len(labels))
+    for i, label_vec in enumerate(labels):
+        active_weights = class_weights[label_vec == 1]
+        if len(active_weights) > 0:
+            sample_weights[i] = np.max(active_weights)
+        else:
+            sample_weights[i] = np.min(class_weights)
+
+    if num_samples is None:
+        num_samples = len(labels)
+
+    sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=num_samples,
+        replacement=True,
+    )
+    return sampler
+
+
+def compute_pos_weight(dataset, cache_dir=None, split_info=None):
+    """Compute pos_weight from dataset's DataFrame directly (no DataLoader iteration).
+
+    pos_weight[i] = sqrt((1 - prevalence[i]) / prevalence[i])
+
+    Args:
+        dataset: MIMICCXRJPGDataset instance (uses dataset.dataframe)
+        cache_dir: Directory to save/load cached .npy file. If None, no caching.
+        split_info: String identifier for cache filename (e.g., 'official_all', 'cv_fold0_nfolds20_p10-11')
+
+    Returns:
+        pos_weight: torch.FloatTensor of shape [num_labels]
+    """
+    # Try loading from cache
+    cache_path = None
+    if cache_dir is not None and split_info is not None:
+        cache_path = Path(cache_dir) / f"pos_weight_train_{split_info}.npy"
+        if cache_path.exists():
+            print(f"Loading cached pos_weight from: {cache_path}")
+            pos_weight = torch.from_numpy(np.load(cache_path)).float()
+            for i, label in enumerate(chexpert_labels):
+                print(f"  {label}: pos_weight(sqrt)={pos_weight[i]:.4f}")
+            return pos_weight
+
+    # Compute from DataFrame
+    df = dataset.dataframe
+    n_samples = len(df)
+    print(f"\nComputing pos_weight from DataFrame ({n_samples} samples)...")
+
+    prevalences = []
+    for label in chexpert_labels:
+        positive_count = (df[label] == 1.0).sum()
+        prevalence = positive_count / n_samples
+        prevalences.append(prevalence)
+
+    prevalences = np.array(prevalences, dtype=np.float64)
+    raw_pos_weight = (1.0 - prevalences) / prevalences
+    pos_weight_np = np.sqrt(raw_pos_weight)
+    pos_weight = torch.from_numpy(pos_weight_np).float()
+
+    # Print per-label info
+    for i, label in enumerate(chexpert_labels):
+        print(f"  {label}: prevalence={prevalences[i]:.4f}, raw_pw={raw_pos_weight[i]:.4f}, pos_weight(sqrt)={pos_weight[i]:.4f}")
+
+    # Save to cache
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(cache_path, pos_weight_np)
+        print(f"Saved pos_weight cache to: {cache_path}")
+
+    return pos_weight
 
 
 class MIMICCXRJPGDataset(Dataset):

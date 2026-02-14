@@ -13,7 +13,8 @@ import pandas as pd
 import wandb
 
 import mimic_cxr_jpg
-from model_factory import get_model
+from peft import set_peft_model_state_dict
+from model_factory import get_model, apply_lora
 from data_transforms import get_val_transform
 from utils import load_config, set_seed
 from calibration_metrics import CalibrationEvaluator
@@ -123,6 +124,7 @@ class Tester:
     def _setup_model(self):
         """Setup model based on configuration."""
         model = get_model(self.config['model'])
+        model = apply_lora(model, self.config['model'])
         model = model.to(self.device)
         model.eval()
 
@@ -151,42 +153,51 @@ class Tester:
             else:
                 new_state_dict[k] = v
 
-        # Check if key remapping is needed for BioViL model
-        # Compare checkpoint keys with model keys to detect structure mismatch
-        model_keys = set(self.model.state_dict().keys())
-        ckpt_keys = set(new_state_dict.keys())
+        lora_config = self.config['model'].get('lora', {})
+        if lora_config.get('enabled', False):
+            # Detect checkpoint format:
+            # - Full PEFT state_dict: keys start with 'base_model.model.'
+            # - Adapter-only (get_peft_model_state_dict): no such prefix
+            is_full_peft = any(k.startswith('base_model.model.') for k in new_state_dict.keys())
+            if is_full_peft:
+                self.model.load_state_dict(new_state_dict, strict=False)
+            else:
+                set_peft_model_state_dict(self.model, new_state_dict)
+            print(f"LoRA checkpoint loaded (Epoch: {self.epoch if self.epoch is not None else 'Unknown'})")
+            print("Merging LoRA adapters into base model...")
+            self.model = self.model.merge_and_unload()
+            self.model.eval()
+            print("LoRA merge complete. Model is now a standard nn.Module.")
+        else:
+            # Full model checkpoint
+            # Check if key remapping is needed for BioViL model
+            model_keys = set(self.model.state_dict().keys())
+            ckpt_keys = set(new_state_dict.keys())
 
-        # Detect if checkpoint was saved with different structure
-        # Case: checkpoint has 'encoder.encoder.conv1.weight' but model expects 'encoder.encoder.encoder.conv1.weight'
-        needs_remapping = False
-        if 'encoder.encoder.conv1.weight' in ckpt_keys and 'encoder.encoder.encoder.conv1.weight' in model_keys:
-            needs_remapping = True
-            print("Detected checkpoint key mismatch - applying key remapping for BioViL model")
+            needs_remapping = False
+            if 'encoder.encoder.conv1.weight' in ckpt_keys and 'encoder.encoder.encoder.conv1.weight' in model_keys:
+                needs_remapping = True
+                print("Detected checkpoint key mismatch - applying key remapping for BioViL model")
 
-        if needs_remapping:
-            remapped_state_dict = {}
-            for k, v in new_state_dict.items():
-                new_key = k
-                # Remap encoder.encoder.* -> encoder.encoder.encoder.*
-                if k.startswith('encoder.encoder.') and not k.startswith('encoder.encoder.encoder.'):
-                    new_key = 'encoder.encoder.encoder.' + k[len('encoder.encoder.'):]
-                # Remap encoder.missing_previous_emb -> encoder.encoder.missing_previous_emb
-                elif k == 'encoder.missing_previous_emb':
-                    new_key = 'encoder.encoder.missing_previous_emb'
-                # Remap encoder.backbone_to_vit.* -> encoder.encoder.backbone_to_vit.*
-                elif k.startswith('encoder.backbone_to_vit.'):
-                    new_key = 'encoder.encoder.backbone_to_vit.' + k[len('encoder.backbone_to_vit.'):]
-                # Remap encoder.vit_pooler.* -> encoder.encoder.vit_pooler.*
-                elif k.startswith('encoder.vit_pooler.'):
-                    new_key = 'encoder.encoder.vit_pooler.' + k[len('encoder.vit_pooler.'):]
-                # Remap projector.* -> encoder.projector.*
-                elif k.startswith('projector.'):
-                    new_key = 'encoder.projector.' + k[len('projector.'):]
-                remapped_state_dict[new_key] = v
-            new_state_dict = remapped_state_dict
+            if needs_remapping:
+                remapped_state_dict = {}
+                for k, v in new_state_dict.items():
+                    new_key = k
+                    if k.startswith('encoder.encoder.') and not k.startswith('encoder.encoder.encoder.'):
+                        new_key = 'encoder.encoder.encoder.' + k[len('encoder.encoder.'):]
+                    elif k == 'encoder.missing_previous_emb':
+                        new_key = 'encoder.encoder.missing_previous_emb'
+                    elif k.startswith('encoder.backbone_to_vit.'):
+                        new_key = 'encoder.encoder.backbone_to_vit.' + k[len('encoder.backbone_to_vit.'):]
+                    elif k.startswith('encoder.vit_pooler.'):
+                        new_key = 'encoder.encoder.vit_pooler.' + k[len('encoder.vit_pooler.'):]
+                    elif k.startswith('projector.'):
+                        new_key = 'encoder.projector.' + k[len('projector.'):]
+                    remapped_state_dict[new_key] = v
+                new_state_dict = remapped_state_dict
 
-        self.model.load_state_dict(new_state_dict)
-        print(f"Checkpoint loaded successfully (Epoch: {self.epoch if self.epoch is not None else 'Unknown'})")
+            self.model.load_state_dict(new_state_dict, strict=False)
+            print(f"Checkpoint loaded successfully (Epoch: {self.epoch if self.epoch is not None else 'Unknown'})")
 
         # Log epoch to wandb
         if self.epoch is not None:
@@ -644,35 +655,38 @@ class Tester:
             print(f"  - probs_label_wise_t.npy: Label-wise T calibrated probabilities [{predictions_data['probs_label_wise_t'].shape}]")
 
     def _save_calibration_metrics(self, calibration_results, prefix):
-        """Save calibration metrics to CSV files."""
+        """Save calibration metrics to a single CSV file per case."""
         output_dir = self.config['output']['dir']
         os.makedirs(output_dir, exist_ok=True)
 
-        # Save each metric separately
-        for metric_name, metric_dict in calibration_results.items():
-            # Create dataframe
-            data = []
-            for key, value in metric_dict.items():
-                if key == 'overall':
-                    label_name = 'Overall'
-                    label_idx = -1
-                else:
-                    label_idx = int(key.split('_')[1])
-                    label_name = mimic_cxr_jpg.chexpert_labels[label_idx]
+        # Collect all label keys across metrics
+        all_keys = set()
+        for metric_dict in calibration_results.values():
+            all_keys.update(metric_dict.keys())
 
-                data.append({
-                    'label_index': label_idx,
-                    'label_name': label_name,
-                    metric_name: value
-                })
+        # Build rows with all metrics in one table
+        data = []
+        for key in sorted(all_keys, key=lambda k: (-1 if k == 'overall' else int(k.split('_')[1]))):
+            if key == 'overall':
+                label_name = 'Overall'
+                label_idx = -1
+            else:
+                label_idx = int(key.split('_')[1])
+                label_name = mimic_cxr_jpg.chexpert_labels[label_idx]
 
-            df = pd.DataFrame(data)
+            row = {'label_index': label_idx, 'label_name': label_name}
+            for metric_name, metric_dict in calibration_results.items():
+                row[metric_name] = metric_dict.get(key, None)
+            data.append(row)
 
-            # Save to CSV
-            csv_path = os.path.join(output_dir, f'calibration_{prefix}_{metric_name}.csv')
-            df.to_csv(csv_path, index=False)
+        # Sort: labels first (by index), then overall at the end
+        data.sort(key=lambda r: (r['label_index'] == -1, r['label_index']))
 
-        print(f"{prefix.capitalize()} calibration metrics saved to: {output_dir}/")
+        df = pd.DataFrame(data)
+        csv_path = os.path.join(output_dir, f'calibration_{prefix}.csv')
+        df.to_csv(csv_path, index=False)
+
+        print(f"{prefix.capitalize()} calibration metrics saved to: {csv_path}")
 
     def _log_to_wandb(self, results_uncal, results_global, results_label_wise,
                      calibration_results_uncal, calibration_results_global, calibration_results_label_wise):
@@ -768,10 +782,29 @@ def main():
         choices=['true', 'false'],
         help='Enable temperature scaling (true/false). If true, fits both global and label-wise T on validation set.'
     )
+    parser.add_argument(
+        '--override',
+        type=str,
+        nargs='+',
+        help='Override config values (e.g., output.dir=./outputs/my_test)'
+    )
     args = parser.parse_args()
 
     # Load configuration
     config = load_config(args.config)
+
+    # Apply overrides if provided
+    if args.override:
+        for override in args.override:
+            key_path, value = override.split('=', 1)
+            keys = key_path.split('.')
+            d = config
+            for key in keys[:-1]:
+                d = d[key]
+            try:
+                d[keys[-1]] = eval(value)
+            except:
+                d[keys[-1]] = value
 
     # Convert string to boolean
     temp_scaling = args.temp_scaling.lower() == 'true'

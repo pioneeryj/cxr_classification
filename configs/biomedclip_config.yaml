@@ -1,0 +1,65 @@
+# BiomedCLIP Configuration for CXR Classification
+# open_clip: microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224
+# ViT-B/16, embed_dim=512, image_size=224
+
+model:
+  name: "BiomedCLIP"
+  pretrained: true
+  num_classes: 14
+  freeze_backbone: true
+  lora:
+    enabled: true
+    r: 16
+    lora_alpha: 32
+    lora_dropout: 0.1
+
+data:
+  datadir: "/mnt/HDD/dataset/medical_report"
+  image_subdir: "mimic-cxr-jpg/2.1.0/files"
+  dicom_id_file: null
+  label_method: "zeros_uncertain_nomask"
+  subject_prefix_filter: ['10', '11']
+
+  split_type: "cv"
+  num_folds: 20
+  fold: 0
+  val_size: 0.1
+  random_state: 0
+  stratify: false
+
+training:
+  num_epochs: 10
+  batch_size: 16  # For 224x224 images
+  learning_rate: 5e-5
+  optimizer: "adam"
+  weight_decay: 1e-4
+  pos_weight: true
+  sqrt_resampling: false
+
+  lr_scheduler:
+    enabled: true
+    patience: 3
+    factor: 0.5
+    early_stop_patience: 10
+
+  val_iters: null
+  amp: true
+  distributed: false
+  single_node_parallel: false
+
+augmentation:
+  horizontal_flip: 0.0
+  rotation_degrees: 0
+  random_crop: false
+  color_jitter: false
+
+output:
+  dir: "./outputs/biomedclip_experiment"
+  save_frequency: 1
+
+system:
+  num_workers: 4
+  pin_memory: true
+  device: "cuda"
+  seed: 0
+  progress_bar: true

@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 import mimic_cxr_jpg
-from model_factory import get_model
+from model_factory import get_model, apply_lora
 from data_transforms import get_val_transform
 from utils import load_config, set_seed
 
@@ -153,7 +153,19 @@ class CalibrationFitter:
             else:
                 new_state_dict[k] = v
 
-        self.model.load_state_dict(new_state_dict)
+        # Detect LoRA weights in checkpoint
+        has_lora = any('lora_' in k for k in new_state_dict.keys())
+        if has_lora:
+            print("Detected LoRA weights in checkpoint. Applying LoRA adapter...")
+            self.model = apply_lora(self.model, self.config['model'])
+            self.model.load_state_dict(new_state_dict, strict=False)
+            print("Merging LoRA adapters into base model...")
+            self.model = self.model.merge_and_unload()
+            self.model.eval()
+            print("LoRA merge complete.")
+        else:
+            self.model.load_state_dict(new_state_dict)
+
         print("Checkpoint loaded successfully")
 
     def _setup_data(self):

@@ -11,7 +11,7 @@ data:
   image_subdir: "mimic-cxr-jpg/2.1.0/files"
   dicom_id_file: null
   label_method: "zeros_uncertain_nomask"
-  subject_prefix_filter: ['10', '11']  # Only use p10, p11, and p12 patients
+  subject_prefix_filter: ['10', '11']  
 
   split_type: "cv"
   num_folds: 10
@@ -21,11 +21,13 @@ data:
   stratify: false
 
 training:
-  num_epochs: 50
+  num_epochs: 10
   batch_size: 8  # For 1024x1024 images
   learning_rate: 1e-3
   optimizer: "adam"
   weight_decay: 0.0
+  pos_weight: true
+  sqrt_resampling: false
 
   lr_scheduler:
     enabled: true

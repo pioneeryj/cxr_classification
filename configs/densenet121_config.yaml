@@ -21,11 +21,13 @@ data:
   stratify: false
 
 training:
-  num_epochs: 50
+  num_epochs: 10
   batch_size: 8  # For 1024x1024 images
   learning_rate: 1e-3
   optimizer: "adam"
   weight_decay: 0.0
+  pos_weight: true
+  sqrt_resampling: false
 
   lr_scheduler:
     enabled: true
@@ -49,7 +51,7 @@ output:
   save_frequency: 1
 
 system:
-  num_workers: 8
+  num_workers: 4
   pin_memory: true
   device: "cuda"
   seed: 0

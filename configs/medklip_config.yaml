@@ -5,6 +5,11 @@ model:
   pretrained: true
   num_classes: 14
   freeze_backbone: true
+  lora:
+    enabled: true
+    r: 16
+    lora_alpha: 32
+    lora_dropout: 0.1
 
 data:
   datadir: "/mnt/HDD/dataset/medical_report"
@@ -21,11 +26,13 @@ data:
   stratify: false
 
 training:
-  num_epochs: 30
-  batch_size: 8  # For 1024x1024 images
+  num_epochs: 10
+  batch_size: 16  # For 512x512 images
   learning_rate: 1e-4
   optimizer: "adam"
   weight_decay: 1e-4
+  pos_weight: true
+  sqrt_resampling: false
 
   lr_scheduler:
     enabled: true

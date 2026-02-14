@@ -5,13 +5,18 @@ model:
   pretrained: true
   num_classes: 14
   freeze_backbone: true
+  lora:
+    enabled: true
+    r: 16
+    lora_alpha: 32
+    lora_dropout: 0.1
 
 data:
   datadir: "/mnt/HDD/dataset/medical_report"
   image_subdir: "mimic-cxr-jpg/2.1.0/files"
   dicom_id_file: null
   label_method: "zeros_uncertain_nomask"
-  subject_prefix_filter: ['10', '11', '12', '13']  # Only use p10, p11, and p12 patients
+  subject_prefix_filter: ['10', '11']  # Only use p10, p11, and p12 patients
 
   split_type: "cv"
   num_folds: 20
@@ -21,11 +26,13 @@ data:
   stratify: false
 
 training:
-  num_epochs: 30
+  num_epochs: 10
   batch_size: 16  # For 512x512 images (increased from 8)
   learning_rate: 5e-5  # Lower LR for fine-tuning
   optimizer: "adam"
   weight_decay: 1e-4
+  pos_weight: true
+  sqrt_resampling: false
 
   lr_scheduler:
     enabled: true

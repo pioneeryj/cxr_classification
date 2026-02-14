@@ -4,6 +4,7 @@ import torch
 from torch import nn
 import torchvision.models as models
 import torch.nn.functional as F
+from peft import LoraConfig, get_peft_model
 
 
 class ModelFactory:
@@ -28,6 +29,10 @@ class ModelFactory:
             model = ModelFactory._create_biovil(num_classes, pretrained, freeze_backbone)
         elif model_name == 'medklip':
             model = ModelFactory._create_medklip(num_classes, pretrained, freeze_backbone)
+        elif model_name == 'medclip':
+            model = ModelFactory._create_medclip(num_classes, pretrained, freeze_backbone)
+        elif model_name == 'biomedclip':
+            model = ModelFactory._create_biomedclip(num_classes, pretrained, freeze_backbone)
         elif 'densenet' in model_name:
             model = ModelFactory._create_densenet(model_name, num_classes, pretrained, freeze_backbone)
         elif 'resnet' in model_name:
@@ -233,6 +238,135 @@ class ModelFactory:
         return model
 
     @staticmethod
+    def _create_medclip(num_classes, pretrained, freeze_backbone):
+        """Create MedCLIP model for classification.
+
+        Uses flax-community/medclip-roco pretrained weights converted to PyTorch.
+        """
+        if not pretrained:
+            raise NotImplementedError("MedCLIP only supports pretrained initialization")
+
+        from transformers import VisionTextDualEncoderModel
+
+        # Load pretrained MedCLIP model (Flax weights auto-converted to PyTorch)
+        model_name = "flax-community/medclip-roco"
+        print(f"Loading MedCLIP from HuggingFace: {model_name}")
+
+        # VisionTextDualEncoderModel can load FlaxHybridCLIP weights
+        clip_model = VisionTextDualEncoderModel.from_pretrained(model_name, from_flax=True)
+
+        class MedCLIPClassifier(nn.Module):
+            """MedCLIP model wrapper for image classification."""
+            def __init__(self, clip_model, num_classes, freeze_encoder=False):
+                super().__init__()
+                self.vision_model = clip_model.vision_model
+                self.visual_projection = clip_model.visual_projection
+
+                # MedCLIP projection dimension
+                projection_dim = clip_model.config.projection_dim  # typically 512
+
+                # Classification head
+                self.classifier = nn.Linear(projection_dim, num_classes)
+
+                if freeze_encoder:
+                    for param in self.vision_model.parameters():
+                        param.requires_grad = False
+                    for param in self.visual_projection.parameters():
+                        param.requires_grad = False
+
+                print("MedCLIP classifier created:")
+                print(f"  - Freeze encoder: {freeze_encoder}")
+                print(f"  - Projection dimension: {projection_dim}")
+                print(f"  - Number of classes: {num_classes}")
+
+            def forward(self, x):
+                """
+                Forward pass through MedCLIP vision encoder and classifier.
+
+                Args:
+                    x: Input image [B, 3, H, W] (RGB format expected by CLIP)
+
+                Returns:
+                    logits: [B, num_classes]
+                """
+                # Get vision model outputs
+                vision_outputs = self.vision_model(pixel_values=x)
+
+                # Get pooled output (CLS token)
+                pooled_output = vision_outputs.pooler_output  # [B, hidden_size]
+
+                # Project to CLIP embedding space
+                image_embeds = self.visual_projection(pooled_output)  # [B, projection_dim]
+
+                # Classification
+                logits = self.classifier(image_embeds)  # [B, num_classes]
+
+                return logits
+
+        # Create classifier model
+        model = MedCLIPClassifier(clip_model, num_classes, freeze_encoder=freeze_backbone)
+
+        return model
+
+    @staticmethod
+    def _create_biomedclip(num_classes, pretrained, freeze_backbone):
+        """Create BiomedCLIP model for classification.
+
+        Uses microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224 via open_clip.
+        ViT-B/16, embed_dim=512, image_size=224.
+        """
+        if not pretrained:
+            raise NotImplementedError("BiomedCLIP only supports pretrained initialization")
+
+        from open_clip import create_model_from_pretrained
+
+        model_name = 'hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224'
+        print(f"Loading BiomedCLIP from: {model_name}")
+
+        clip_model, _ = create_model_from_pretrained(model_name)
+
+        class BiomedCLIPClassifier(nn.Module):
+            """BiomedCLIP vision encoder wrapper for image classification."""
+            def __init__(self, clip_model, num_classes, freeze_encoder=False):
+                super().__init__()
+                self.visual = clip_model.visual
+
+                # Get embed dimension from the visual encoder
+                # open_clip ViT: output is projected to embed_dim (512)
+                embed_dim = 512
+
+                # Classification head
+                self.classifier = nn.Linear(embed_dim, num_classes)
+
+                if freeze_encoder:
+                    for param in self.visual.parameters():
+                        param.requires_grad = False
+
+                print("BiomedCLIP classifier created:")
+                print(f"  - Backbone: ViT-B/16")
+                print(f"  - Freeze encoder: {freeze_encoder}")
+                print(f"  - Embed dimension: {embed_dim}")
+                print(f"  - Number of classes: {num_classes}")
+
+            def forward(self, x):
+                """
+                Forward pass through BiomedCLIP vision encoder and classifier.
+
+                Args:
+                    x: Input image [B, 3, 224, 224]
+
+                Returns:
+                    logits: [B, num_classes]
+                """
+                image_features = self.visual(x)  # [B, 512]
+                logits = self.classifier(image_features)  # [B, num_classes]
+                return logits
+
+        model = BiomedCLIPClassifier(clip_model, num_classes, freeze_encoder=freeze_backbone)
+
+        return model
+
+    @staticmethod
     def _create_densenet(arch, num_classes, pretrained, freeze_backbone):
         """Create DenseNet model adapted for grayscale medical images."""
         # Map architecture string to model constructor
@@ -323,3 +457,143 @@ class ModelFactory:
 def get_model(config):
     """Convenience function to get a model from config."""
     return ModelFactory.create_model(config)
+
+
+# --- LoRA target module configuration per model ---
+
+# Keywords to match in named_modules() for each model type
+_LORA_TARGET_KEYWORDS = {
+    'medklip': ['conv2'],
+    'biovil': ['conv2'],
+    'medclip': ['qkv', 'q_proj', 'v_proj', 'query', 'value'],
+    'biomedclip': ['query', 'value', 'qkv', 'q_proj', 'v_proj', 'in_proj'],
+}
+
+_LORA_MODULES_TO_SAVE = {
+    'medklip': ['classifier', 'res_l1', 'res_l2'],
+    'biovil': ['classifier'],
+    'medclip': ['classifier'],
+    'biomedclip': ['classifier'],
+}
+
+
+def _get_lora_target_modules(model, model_name):
+    """Determine LoRA target modules by inspecting the model's named_modules().
+
+    For Conv2d targets (ResNet-based models), filters to only the latter half
+    of sequential blocks to focus LoRA on deeper layers.
+
+    Args:
+        model: PyTorch model
+        model_name: Model name string (lowercase)
+
+    Returns:
+        target_modules: list of module name strings for LoRA
+        modules_to_save: list of module name strings to keep trainable
+    """
+    keywords = _LORA_TARGET_KEYWORDS.get(model_name, [])
+    modules_to_save = _LORA_MODULES_TO_SAVE.get(model_name, ['classifier'])
+
+    if not keywords:
+        raise ValueError(f"No LoRA target keywords defined for model: {model_name}")
+
+    # Collect all matching module names
+    matched_modules = []
+    for name, module in model.named_modules():
+        for kw in keywords:
+            if kw in name.split('.')[-1]:
+                matched_modules.append(name)
+                break
+
+    if not matched_modules:
+        raise ValueError(
+            f"No modules matched LoRA target keywords {keywords} in model {model_name}. "
+            f"Check model architecture with model.named_modules()."
+        )
+
+    print(f"[LoRA] Model: {model_name}")
+    print(f"[LoRA] Target modules ({len(matched_modules)}): {matched_modules[:10]}{'...' if len(matched_modules) > 10 else ''}")
+    print(f"[LoRA] Modules to save: {modules_to_save}")
+
+    return matched_modules, modules_to_save
+
+
+def _filter_latter_half_blocks(module_names):
+    """Filter Conv2d module names to keep only the latter half of sequential blocks.
+
+    For ResNet-based models, modules follow patterns like:
+    - res_features.4.0.conv2, res_features.6.2.conv3
+    - encoder.encoder.encoder.layer3.0.conv2
+
+    This function identifies the block indices and keeps only the latter half.
+    """
+    import re
+
+    # Group by parent block prefix (everything before the block index)
+    # e.g., "res_features.6" -> group all modules under res_features.6.*
+    # We want to find the top-level sequential groups and filter latter half
+
+    # Extract the top-level block identifier (first two levels for res_features.N)
+    block_indices = set()
+    for name in module_names:
+        # Match patterns like "res_features.6" or "layer4"
+        match = re.match(r'(.*?\.\d+)', name)
+        if match:
+            block_indices.add(match.group(1))
+
+    if not block_indices:
+        return module_names
+
+    # Sort block identifiers and take latter half
+    sorted_blocks = sorted(block_indices)
+    half = len(sorted_blocks) // 2
+    latter_blocks = set(sorted_blocks[half:])
+
+    # Filter module names to those in latter half blocks
+    filtered = []
+    for name in module_names:
+        match = re.match(r'(.*?\.\d+)', name)
+        if match and match.group(1) in latter_blocks:
+            filtered.append(name)
+
+    if not filtered:
+        # Fallback: return all if filtering removed everything
+        return module_names
+
+    return filtered
+
+
+def apply_lora(model, model_config):
+    """Apply PEFT LoRA adapter to a model based on config.
+
+    Args:
+        model: PyTorch model (already created by ModelFactory)
+        model_config: Model configuration dict with optional 'lora' section
+
+    Returns:
+        Model with LoRA adapters applied, or original model if LoRA disabled
+    """
+    lora_config = model_config.get('lora', {})
+    if not lora_config.get('enabled', False):
+        return model
+
+    model_name = model_config['name'].lower()
+    r = lora_config.get('r', 16)
+    lora_alpha = lora_config.get('lora_alpha', 32)
+    lora_dropout = lora_config.get('lora_dropout', 0.1)
+
+    target_modules, modules_to_save = _get_lora_target_modules(model, model_name)
+
+    config = LoraConfig(
+        r=r,
+        lora_alpha=lora_alpha,
+        target_modules=target_modules,
+        lora_dropout=lora_dropout,
+        bias="none",
+        modules_to_save=modules_to_save,
+    )
+
+    model = get_peft_model(model, config)
+    model.print_trainable_parameters()
+
+    return model

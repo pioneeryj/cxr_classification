@@ -19,7 +19,8 @@ import glob
 
 import mimic_cxr_jpg
 from meters import CSVMeter
-from model_factory import get_model
+from peft import get_peft_model_state_dict, set_peft_model_state_dict
+from model_factory import get_model, apply_lora
 from data_transforms import get_train_transform, get_val_transform
 from utils import load_config, set_seed, setup_output_dir, save_config, count_parameters, get_lr
 
@@ -72,6 +73,49 @@ def safe_collate_fn(batch):
     return images_batch, labels_batch, masks_batch
 
 
+class EarlyStopping:
+    """주어진 patience 동안 검증 손실이 개선되지 않으면 학습을 조기에 중단합니다."""
+
+    def __init__(self, patience=7, verbose=True, delta=0, path='checkpoint', lora_enabled=False):
+        self.patience = patience
+        self.verbose = verbose
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.val_loss_min = np.inf
+        self.delta = delta
+        self.path = path
+        self.lora_enabled = lora_enabled
+
+    def __call__(self, val_loss, model):
+        score = -val_loss
+        if self.best_score is None:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+        elif score < self.best_score + self.delta:
+            self.counter += 1
+            if self.verbose:
+                print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+            self.counter = 0
+
+    def save_checkpoint(self, val_loss, model):
+        """검증 손실이 감소하면 모델을 저장합니다."""
+        if self.verbose:
+            print(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}). Saving model...')
+        os.makedirs(self.path, exist_ok=True)
+        if self.lora_enabled:
+            state_dict = get_peft_model_state_dict(model)
+        else:
+            state_dict = model.state_dict()
+        torch.save(state_dict, os.path.join(self.path, 'best_model.pt'))
+        self.val_loss_min = val_loss
+
+
 class Trainer:
     """Trainer class for CXR classification."""
 
@@ -81,11 +125,18 @@ class Trainer:
         Args:
             config: Configuration dictionary
             resume: If True, try to resume from the latest checkpoint
-            checkpoint_dir: Directory to save/load checkpoints (default: /mnt/HDD/yoonji/mrg/cxr_classification/weight)
+            checkpoint_dir: Directory to save/load checkpoints (default: auto-generated)
         """
         self.config = config
         self.resume = resume
-        self.checkpoint_dir = checkpoint_dir or '/mnt/HDD/yoonji/mrg/cxr_classification/weight'
+
+        # Build checkpoint directory with training config info
+        if checkpoint_dir is not None:
+            self.checkpoint_dir = checkpoint_dir
+        else:
+            self.checkpoint_dir = self._build_checkpoint_dir()
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        print(f"Checkpoint directory: {self.checkpoint_dir}")
 
         # Check CUDA availability
         device_str = config['system']['device']
@@ -119,9 +170,19 @@ class Trainer:
         self.train_loader, self.val_loader, self.test_loader = self._setup_data()
 
         # Setup training components
-        self.criterion = nn.BCEWithLogitsLoss(reduction='none')
+        self.criterion = self._setup_criterion()
         self.optimizer = self._setup_optimizer()
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min', factor=0.5, patience=2, verbose=True,
+        )
         self.scaler = torch.cuda.amp.GradScaler(enabled=config['training']['amp'])
+
+        # Early stopping
+        lora_enabled = self.config['model'].get('lora', {}).get('enabled', False)
+        self.early_stopping = EarlyStopping(
+            patience=7, verbose=True, path=self.checkpoint_dir,
+            lora_enabled=lora_enabled,
+        )
 
         # Setup metrics tracking
         self.epoch_meter = CSVMeter(os.path.join(self.output_dir, 'epoch_metrics.csv'), buffering=1)
@@ -132,13 +193,25 @@ class Trainer:
         self.start_epoch = 0
         self.current_epoch = 0
         self.total_iters = 0
-        self.best_val_loss = float('inf')
-        self.val_loss_history = []
-        self.epochs_without_improvement = 0
 
         # Try to resume from checkpoint if enabled
         if self.resume:
             self._try_resume_from_checkpoint()
+
+    def _build_checkpoint_dir(self):
+        """Build checkpoint directory name reflecting training config."""
+        base_dir = '/mnt/HDD/yoonji/mrg/cxr_classification/weight'
+        model_name = self.config['model']['name']
+        pos_weight = self.config['training'].get('pos_weight', False)
+        resampling = self.config['training'].get('sqrt_resampling', False)
+        lora_enabled = self.config['model'].get('lora', {}).get('enabled', False)
+
+        dir_name = f"{model_name}_posweight={pos_weight}_resampling={resampling}"
+        if lora_enabled:
+            lora_r = self.config['model']['lora'].get('r', 16)
+            dir_name += f"_lora_r={lora_r}"
+
+        return os.path.join(base_dir, dir_name)
 
     def _try_resume_from_checkpoint(self):
         """Try to resume training from the latest checkpoint.
@@ -180,8 +253,17 @@ class Trainer:
                 new_state_dict[k] = v
 
         # Load state dict into model
-        # Handle case where model is wrapped in DataParallel
-        if hasattr(self.model, 'module'):
+        lora_enabled = self.config['model'].get('lora', {}).get('enabled', False)
+        if lora_enabled:
+            # Detect checkpoint format:
+            # - Full PEFT state_dict: keys start with 'base_model.model.'
+            # - Adapter-only (get_peft_model_state_dict): no such prefix
+            is_full_peft = any(k.startswith('base_model.model.') for k in new_state_dict.keys())
+            if is_full_peft:
+                self.model.load_state_dict(new_state_dict, strict=False)
+            else:
+                set_peft_model_state_dict(self.model, new_state_dict)
+        elif hasattr(self.model, 'module'):
             self.model.module.load_state_dict(new_state_dict)
         else:
             self.model.load_state_dict(new_state_dict)
@@ -205,6 +287,7 @@ class Trainer:
     def _setup_model(self):
         """Setup model based on configuration."""
         model = get_model(self.config['model'])
+        model = apply_lora(model, self.config['model'])
 
         # Print model info
         total_params, trainable_params = count_parameters(model)
@@ -283,13 +366,23 @@ class Trainer:
         # Create data loaders
         use_distributed = train_config['distributed']
 
+        # Determine train sampler
+        use_sqrt_resampling = train_config.get('sqrt_resampling', False)
+        if use_distributed:
+            train_sampler = DistributedSampler(train_ds, shuffle=True)
+        elif use_sqrt_resampling:
+            train_sampler = mimic_cxr_jpg.get_sqrt_resampling_sampler(train_ds)
+            print(f"Using square root resampling sampler (num_samples={len(train_ds)})")
+        else:
+            train_sampler = None
+
         train_loader = DataLoader(
             train_ds,
             batch_size=train_config['batch_size'],
-            shuffle=not use_distributed,
+            shuffle=(train_sampler is None),
             num_workers=self.config['system']['num_workers'],
             pin_memory=self.config['system']['pin_memory'],
-            sampler=DistributedSampler(train_ds, shuffle=True) if use_distributed else None,
+            sampler=train_sampler,
             collate_fn=safe_collate_fn,
         )
 
@@ -316,7 +409,52 @@ class Trainer:
         print(f"Dataset sizes - Train: {len(train_ds)}, Val: {len(val_ds)}, Test: {len(test_ds)}")
         print(f"Batches - Train: {len(train_loader)}, Val: {len(val_loader)}, Test: {len(test_loader)}")
 
+        # Save train dataset for pos_weight computation
+        self.train_ds = train_ds
+
         return train_loader, val_loader, test_loader
+
+    def _get_split_info(self):
+        """Generate split info string for pos_weight cache filename."""
+        data_config = self.config['data']
+        split_type = data_config['split_type']
+
+        prefix_filter = data_config.get('subject_prefix_filter', None)
+        if prefix_filter is not None:
+            prefix_str = '-'.join(str(p) for p in sorted(prefix_filter))
+        else:
+            prefix_str = 'all'
+
+        if split_type == 'cv':
+            fold = data_config.get('fold', 0)
+            num_folds = data_config.get('num_folds', 10)
+            return f"cv_fold{fold}_nfolds{num_folds}_p{prefix_str}"
+        else:
+            return f"official_p{prefix_str}"
+
+    def _compute_pos_weight(self):
+        """Compute pos_weight from training dataset DataFrame (with caching)."""
+        cache_dir = os.path.join(os.path.dirname(__file__), 'dataset')
+        split_info = self._get_split_info()
+        return mimic_cxr_jpg.compute_pos_weight(
+            self.train_ds,
+            cache_dir=cache_dir,
+            split_info=split_info,
+        )
+
+    def _setup_criterion(self):
+        """Setup loss criterion based on configuration."""
+        use_pos_weight = self.config['training'].get('pos_weight', False)
+
+        if use_pos_weight:
+            pos_weight = self._compute_pos_weight().to(self.device)
+            criterion = nn.BCEWithLogitsLoss(reduction='none', pos_weight=pos_weight)
+            print(f"\nUsing BCEWithLogitsLoss with pos_weight")
+        else:
+            criterion = nn.BCEWithLogitsLoss(reduction='none')
+            print(f"\nUsing BCEWithLogitsLoss without pos_weight")
+
+        return criterion
 
     def _setup_optimizer(self):
         """Setup optimizer based on configuration."""
@@ -381,19 +519,20 @@ class Trainer:
                 # Validate
                 val_metrics = self.validate()
 
-                # Update learning rate based on validation loss
+                # Update learning rate via scheduler
                 current_val_loss = val_metrics['val']['loss']
-                self._update_learning_rate(current_val_loss)
+                self.scheduler.step(current_val_loss)
 
-                # Save checkpoint
+                # Save periodic checkpoint
                 if (epoch + 1) % self.config['output']['save_frequency'] == 0:
                     self.save_checkpoint(epoch)
 
                 # Log metrics
                 self.log_epoch_metrics(epoch, train_loss, val_metrics)
 
-                # Check for early stopping
-                if self._should_early_stop():
+                # Early stopping (saves best model internally)
+                self.early_stopping(current_val_loss, self.model)
+                if self.early_stopping.early_stop:
                     print(f"Early stopping at epoch {epoch}")
                     break
 
@@ -541,41 +680,6 @@ class Trainer:
         self.model.train()
         return metrics
 
-    def _update_learning_rate(self, val_loss):
-        """Update learning rate based on validation loss."""
-        lr_config = self.config['training'].get('lr_scheduler', {})
-        if not lr_config.get('enabled', False):
-            return
-
-        self.val_loss_history.append(val_loss)
-
-        # Check if we should reduce learning rate
-        patience = lr_config.get('patience', 3)
-        if len(self.val_loss_history) > patience:
-            recent_losses = self.val_loss_history[-patience:]
-            if all(recent_losses[i] >= recent_losses[i-1] for i in range(1, len(recent_losses))):
-                # Learning rate reduction
-                factor = lr_config.get('factor', 0.5)
-                for param_group in self.optimizer.param_groups:
-                    param_group['lr'] *= factor
-                print(f"Reduced learning rate to {get_lr(self.optimizer):.6f}")
-
-        # Track best validation loss
-        if val_loss < self.best_val_loss:
-            self.best_val_loss = val_loss
-            self.epochs_without_improvement = 0
-        else:
-            self.epochs_without_improvement += 1
-
-    def _should_early_stop(self):
-        """Check if training should be stopped early."""
-        lr_config = self.config['training'].get('lr_scheduler', {})
-        if not lr_config.get('enabled', False):
-            return False
-
-        patience = lr_config.get('early_stop_patience', 10)
-        return self.epochs_without_improvement >= patience
-
     def save_checkpoint(self, epoch):
         """Save model checkpoint."""
         # Create weight directory if it doesn't exist
@@ -588,7 +692,14 @@ class Trainer:
             weight_dir,
             f'{model_name}_{epoch}ep.pt'
         )
-        torch.save(self.model.state_dict(), checkpoint_path)
+
+        lora_enabled = self.config['model'].get('lora', {}).get('enabled', False)
+        if lora_enabled:
+            state_dict = get_peft_model_state_dict(self.model)
+        else:
+            state_dict = self.model.state_dict()
+
+        torch.save(state_dict, checkpoint_path)
         print(f"Saved checkpoint to: {checkpoint_path}")
 
     def log_epoch_metrics(self, epoch, train_loss, val_metrics):
@@ -706,10 +817,15 @@ def main():
                 d = d[key]
 
             # Set the value (try to infer type)
-            try:
-                d[keys[-1]] = eval(value)
-            except:
-                d[keys[-1]] = value
+            if value.lower() == 'true':
+                d[keys[-1]] = True
+            elif value.lower() == 'false':
+                d[keys[-1]] = False
+            else:
+                try:
+                    d[keys[-1]] = eval(value)
+                except:
+                    d[keys[-1]] = value
 
     # Determine resume mode
     resume = (args.resume.lower() == 'true') and (not args.no_resume)
